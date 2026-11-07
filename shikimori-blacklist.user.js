@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Shikimori — Чёрный список
 // @namespace    shikimori-local-blacklist
-// @version      1.3.1
+// @version      1.4.0
 // @description  Автоматические метки «Вы в ЧС» возле авторов комментариев. Локально, с кэшем, без отправки сообщений.
 // @match        https://shikimori.io/*
 // @match        https://shikimori.one/*
@@ -87,11 +87,21 @@
   function cached(row, now = Date.now()) {
     if (!row?.checkedAt || row.status === 'pending') return false;
     const age = now - Date.parse(row.checkedAt);
-    return age >= 0 && age < (['error', 'unknown'].includes(row.status) ? ERROR_CACHE_MS : CACHE_MS);
+    return age >= 0 && (row.status === 'blocked' || age < (['error', 'unknown'].includes(row.status) ? ERROR_CACHE_MS : CACHE_MS));
   }
-  function nextCandidate(candidates, rows, ownNick) {
-    return candidates.filter(p => keyOf(p.nick) !== keyOf(ownNick) && !cached(rows.get(keyOf(p.nick))))
-      .sort((a, b) => (Date.parse(rows.get(keyOf(a.nick))?.checkedAt) || 0) - (Date.parse(rows.get(keyOf(b.nick))?.checkedAt) || 0))[0];
+  function nextCandidate(candidates, rows, ownNick, entered = new Set()) {
+    return candidates.filter(p => keyOf(p.nick) !== keyOf(ownNick) && (!cached(rows.get(keyOf(p.nick))) || entered.has(keyOf(p.nick))))
+      .sort((a, b) => (Number(entered.has(keyOf(b.nick))) - Number(entered.has(keyOf(a.nick)))) || (Date.parse(rows.get(keyOf(a.nick))?.checkedAt) || 0) - (Date.parse(rows.get(keyOf(b.nick))?.checkedAt) || 0))[0];
+  }
+  function queueAgain(row) {
+    if (row.status === 'blocked') row.recheck = true;
+    else Object.assign(row, { status: 'pending', checkedAt: null, reason: '' });
+  }
+  function acceptResult(row, result, at = stamp()) {
+    row.recheck = false;
+    if (row.status === 'blocked' && result.status === 'unknown') {
+      row.lastCheckError = result.reason; row.lastAttemptAt = at;
+    } else { Object.assign(row, result, { checkedAt: at }); delete row.lastCheckError; }
   }
   function evictionIndex(rows) {
     let chosen = -1, oldest = Infinity;
@@ -103,7 +113,7 @@
     return chosen;
   }
   // Observe author links only, never arbitrary links or quoted message text.
-  function watchAuthors(doc, rowFor, changed, clock = () => Date.now()) {
+  function watchAuthors(doc, rowFor, changed, clock = () => Date.now(), entered = () => {}) {
     const win = doc.defaultView;
     const selector = '.b-comment header .name-date a.name[href], .b-topic header .name-date a.name[href], .b-topic .author .b-user16 a[href], .b-dialog .name-date a.name[href]';
     const tracked = new Map(), visible = new Set();
@@ -134,13 +144,16 @@
           badge.setAttribute('aria-label', 'Вы в чёрном списке этого пользователя');
           a.after(badge); badges.set(a, badge);
         }
-        badge.title = 'Подтверждено ' + new Date(row.checkedAt).toLocaleString() + '. Повторная проверка через 2 минуты при видимом авторе, с учётом очереди. Отсутствие метки не означает отсутствие ЧС.';
+        badge.title = 'Подтверждено ' + new Date(row.checkedAt).toLocaleString() + '. Последнее подтверждение сохраняется до проверки снятия блокировки. Повторная проверка — при появлении автора на экране. Отсутствие метки не означает отсутствие ЧС.';
       }
     }
     const observer = new win.IntersectionObserver(entries => {
+      const before = new Set([...visible].map(a => keyOf(tracked.get(a)?.nick || '')));
       for (const e of entries) {
         if (e.isIntersecting) visible.add(e.target); else visible.delete(e.target);
       }
+      const after = new Map([...visible].filter(a => tracked.has(a)).map(a => [keyOf(tracked.get(a).nick), tracked.get(a)]));
+      for (const [key, p] of after) if (!before.has(key)) entered(p);
       changed();
     }, { threshold: 0.01 });
     function discover(scope) {
@@ -182,7 +195,7 @@
     };
   }
   // Test-only CommonJS entry; browsers do not expose module in the userscript sandbox.
-  if (typeof module === 'object' && module.exports) { module.exports = { profile, identity, classify, collect, csvCell, fresh, segment, cached, watchAuthors, nextCandidate, evictionIndex }; return; }
+  if (typeof module === 'object' && module.exports) { module.exports = { profile, identity, classify, collect, csvCell, fresh, segment, cached, watchAuthors, nextCandidate, evictionIndex, queueAgain, acceptResult }; return; }
 
   let me, state, storageKey, busy = false, halted = false, controller, host, root, panel, message, results, summary;
   let listTab = 'all', listPage = 1, listQuery = '', listControls, searchInput, allTab, blockedTab, prevPage, nextPageButton, pageLabel;
@@ -190,7 +203,7 @@
   let watcher, autoTimer, autoButton, pumping = false, index = new Map();
   let loadedKey, loadedRaw, loadedState, indexedState, revision = 0, renderedRevision = -1, renderExpires = 0;
   let storageListener, storageDirty = true;
-  const seen = new Map();
+  const seen = new Map(), blockedDue = new Set();
   const autoEnabled = () => !!storageKey && GM_getValue(storageKey + ':auto', true) === true;
   function indexRows(force = false) { if (!force && indexedState === state) return; index = new Map((state?.rows || []).map(r => [keyOf(r.nick), r])); indexedState = state; revision++; }
   function pauseAuto() { if (storageKey) GM_setValue(storageKey + ':auto', false); }
@@ -315,11 +328,11 @@
       }
       watcher.paint(); render();
       if (!autoEnabled() || state.cooldown > Date.now()) return;
-      if (!nextCandidate(watcher.candidates(), index, me.nick)) return;
+      if (!nextCandidate(watcher.candidates(), index, me.nick, blockedDue)) return;
       await job(async () => {
         if (!autoEnabled() || document.hidden) return;
         // Re-evaluate under the shared lock: another tab may already have checked it.
-        const p = nextCandidate(watcher?.candidates() || [], index, me.nick);
+        const p = nextCandidate(watcher?.candidates() || [], index, me.nick, blockedDue);
         if (!p) return;
         let row = index.get(keyOf(p.nick));
         if (!row) {
@@ -331,16 +344,18 @@
           }
           row = { ...p, lastSeenAt: stamp(), sources: ['автор на экране'], status: 'pending', checkedAt: null, reason: '' };
           state.rows.push(row);
-        } else Object.assign(row, { status: 'pending', checkedAt: null, reason: '' });
+        } else if (row.status !== 'blocked') queueAgain(row);
         save(); watcher?.paint();
         say('Автометки: проверяю ' + row.nick + '…');
         try {
           const doc = await get(me.path + '/dialogs/' + segment(row.nick), () => autoEnabled() && !document.hidden && !!watcher?.candidates().some(p => keyOf(p.nick) === keyOf(row.nick)));
-          Object.assign(row, classify(doc, me, row), { checkedAt: stamp() });
+          const result = classify(doc, me, row);
+          acceptResult(row, result); blockedDue.delete(keyOf(row.nick));
           save(); watcher?.paint();
-          if (row.status === 'unknown') throw new Error('Автометки приостановлены: ' + row.reason);
+          if (result.status === 'unknown') throw new Error('Автометки приостановлены: ' + result.reason);
           say('Автометки: проверен ' + row.nick + '.');
         } catch (e) {
+          if (e.name !== 'AbortError' && row.status === 'blocked') { row.lastCheckError = e.message; row.lastAttemptAt = stamp(); }
           if (e.name !== 'AbortError' && row.status === 'pending') Object.assign(row, { status: 'error', reason: e.message, checkedAt: stamp() });
           save(); throw e;
         }
@@ -351,7 +366,7 @@
   function startWatching() {
     watcher?.destroy(); clearInterval(autoTimer);
     if (storageListener !== undefined && typeof GM_removeValueChangeListener === 'function') GM_removeValueChangeListener(storageListener);
-    storageListener = undefined; storageDirty = true; seen.clear();
+    storageListener = undefined; storageDirty = true; seen.clear(); blockedDue.clear();
     if (busy) { setTimeout(startWatching, 250); return; }
     me = identity(document);
     if (!me) { state = null; index.clear(); return; }
@@ -362,7 +377,7 @@
         if (remote) { storageDirty = true; void autoTick(); }
       });
       if (!window.IntersectionObserver) { say('Автометки недоступны: обновите браузер.'); return; }
-      watcher = watchAuthors(document, p => identity(document)?.id === me.id ? index.get(keyOf(p.nick)) : null, () => { void autoTick(); });
+      watcher = watchAuthors(document, p => identity(document)?.id === me.id ? index.get(keyOf(p.nick)) : null, () => { void autoTick(); }, () => Date.now(), p => { if (index.get(keyOf(p.nick))?.status === 'blocked') blockedDue.add(keyOf(p.nick)); });
       autoTimer = setInterval(autoTick, 2000);
     } catch (e) { say(e.message); }
   }
@@ -387,13 +402,13 @@
   }
   async function scan() {
     let count = 0;
-    for (const row of state.rows.filter(r => r.status === 'pending')) {
+    for (const row of state.rows.filter(r => r.status === 'pending' || r.recheck)) {
       if (halted) break;
       say('Проверяю ' + row.nick + '… (проверка ' + (++count) + ')');
       try {
         const doc = await get(me.path + '/dialogs/' + segment(row.nick));
         const result = classify(doc, me, row);
-        Object.assign(row, result, { checkedAt: stamp() });
+        acceptResult(row, result); blockedDue.delete(keyOf(row.nick));
         save(); watcher?.paint(); render();
         if (result.status === 'unknown') throw new Error('Неоднозначный ответ для ' + row.nick + ': ' + result.reason);
       } catch (e) {
@@ -426,12 +441,13 @@
     if (renderedRevision === revision && now < renderExpires) return;
     renderedRevision = revision; renderExpires = Infinity;
     for (const row of state.rows) {
+      if (row.status === 'blocked') continue;
       const expiry = Date.parse(row.checkedAt) + (['unknown', 'error'].includes(row.status) ? ERROR_CACHE_MS : CACHE_MS);
       if (expiry > now) renderExpires = Math.min(renderExpires, expiry);
     }
     const blocked = state.rows.filter(r => r.status === 'blocked');
-    const currentBlocked = blocked.filter(r => cached(r, now)).length;
-    summary.textContent = `Всего: ${state.rows.length} · в ЧС (свежее): ${currentBlocked} · устаревших подтверждений: ${blocked.length - currentBlocked}`;
+    const currentBlocked = blocked.length;
+    summary.textContent = `Всего: ${state.rows.length} · в ЧС: ${currentBlocked}`;
     allTab.textContent = 'Все (' + state.rows.length + ')';
     blockedTab.textContent = 'Вы в ЧС (' + blocked.length + ')';
     allTab.setAttribute('aria-selected', String(listTab === 'all'));
@@ -465,7 +481,7 @@
     storageKey = 'shiki-blacklist:v1:' + location.hostname + ':' + me.id;
     try { state = load(); indexRows(); } catch(e) { say(e.message); panel.hidden = false; return; }
     panel.hidden = false; renderedRevision = -1; render();
-    say('Автометки проверяют авторов комментариев при чтении. Нет метки — не значит, что нет ЧС. Видимые авторы перепроверяются после двух минут с учётом очереди.');
+    say('Автометки проверяют авторов комментариев при чтении. Нет метки — не значит, что нет ЧС. Обычные результаты свежи две минуты. Подтверждённый ЧС перепроверяется при появлении автора на экране.');
   }
   function mount() {
     if (document.getElementById('shiki-local-blacklist')) return;
@@ -486,7 +502,7 @@
     svg.append(circle, slash); launch.append(svg);
     panel = element('section', '', root); panel.hidden = true; panel.setAttribute('aria-label', 'Чёрный список');
     button('Закрыть', () => { panel.hidden = true; }, panel, true);
-    element('h2', 'Чёрный список · 1.3.1');
+    element('h2', 'Чёрный список · 1.4.0');
     element('p', 'Глобального списка нет. Здесь только результаты проверки собранных пользователей. Статус может измениться.');
     summary = element('p'); message = element('p'); message.className = 'status'; message.setAttribute('role', 'status');
     autoButton = button('Автометки', () => {
@@ -500,7 +516,7 @@
     const guarded = f => () => { if (!me || !state) return say('Сначала войдите и откройте панель заново.'); return job(f); };
     button('Обновить метки сейчас', guarded(async () => {
       const visible = new Set((watcher?.candidates() || []).map(p => keyOf(p.nick)));
-      for (const row of state.rows) if (visible.has(keyOf(row.nick))) Object.assign(row, { status: 'pending', checkedAt: null, reason: '' });
+      for (const row of state.rows) if (visible.has(keyOf(row.nick))) { queueAgain(row); if (row.status === 'blocked') blockedDue.add(keyOf(row.nick)); }
       GM_setValue(storageKey + ':auto', true);
       save(); watcher?.paint();
       say('Повторная проверка видимых авторов включена. Интервал запросов и серверные паузы сохраняются.');
@@ -516,11 +532,11 @@
       say('Добавлено: ' + add(users, 'вручную') + '. Кэш — до 10 000 записей.'); input.value = '';
     }), details);
     button('Повторить неизвестные и ошибки', guarded(async () => { for (const r of state.rows) if (['unknown','error'].includes(r.status)) Object.assign(r, { status: 'pending', checkedAt: null, reason: '' }); save(); say('Возвращены в очередь. Нажмите «Продолжить».'); }), details);
-    button('Перепроверить все собранные', guarded(async () => { for (const r of state.rows) Object.assign(r, { status: 'pending', checkedAt: null, reason: '' }); save(); say('Очередь восстановлена. Нажмите «Продолжить».'); }), details);
+    button('Перепроверить все собранные', guarded(async () => { for (const r of state.rows) queueAgain(r); save(); say('Очередь восстановлена. Нажмите «Продолжить».'); }), details);
     button('Экспорт JSON', () => state && download('json'));
     button('Экспорт CSV', () => state && download('csv'));
     button('Удалить локальные данные', guarded(async () => { if (!confirm('Удалить сохранённые результаты для этого аккаунта и домена?')) return; pauseAuto(); GM_deleteValue(storageKey); state = fresh(me); loadedState = null; seen.clear(); indexRows(); watcher?.paint(); say('Локальные данные удалены. Автометки на паузе.'); }));
-    element('p', 'Автометки включены по умолчанию. Проверяются только авторы на экране; в скрытой вкладке новые проверки не запускаются. Видимые авторы перепроверяются после двух минут с учётом очереди. Просроченные метки скрываются до нового подтверждения. Нет метки — не значит, что нет ЧС. Один запрос раз в 5–7 секунд. Стоп и ошибки ставят автометки на паузу. Данные локальные; переписка и cookies не сохраняются.');
+    element('p', 'Автометки включены по умолчанию. Проверяются только авторы на экране; в скрытой вкладке новые проверки не запускаются. Обычные результаты свежи две минуты. Подтверждённый ЧС перепроверяется при появлении автора на экране. Метка ЧС сохраняется до подтверждения снятия блокировки. Нет метки — не значит, что нет ЧС. Один запрос раз в 5–7 секунд. Стоп и ошибки ставят автометки на паузу. Данные локальные; переписка и cookies не сохраняются.');
     listControls = element('div');
     const tabs = element('div', '', listControls); tabs.setAttribute('role', 'tablist');
     allTab = button('Все', () => { listTab = 'all'; listPage = 1; refreshList(); }, tabs, true);
